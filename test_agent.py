@@ -214,3 +214,139 @@ def test_import_has_no_side_effects_and_logs_no_bodies(ctx, caplog):
     with caplog.at_level("DEBUG"):
         agent.accept(A.build_reply_event("nip44", agent_pub, "my secret message", user_sk))
     assert "my secret message" not in caplog.text
+
+
+# -- shared brain and persistent memory --------------------------------------
+
+class FakeNipae:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, slug):
+        return self.store.get(slug)
+
+    def set(self, slug, value):
+        assert minipae.validate_slug(slug), slug
+        self.store[slug] = value
+        return True
+
+
+async def _bridge(card_id="dna_abc", fail=False):
+    """A stand-in for agent-voice's HTTP bridge (/health, /chat) on loopback."""
+    seen = []
+
+    async def handle(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        line = head.split(b"\r\n")[0].decode()
+        length = 0
+        for h in head.split(b"\r\n"):
+            if h.lower().startswith(b"content-length:"):
+                length = int(h.split(b":")[1])
+        body = await reader.readexactly(length) if length else b""
+        if line.startswith("GET /health"):
+            out, code = {"status": "ok", "card_id": card_id}, 200
+        elif fail:
+            out, code = {"error": "boom"}, 500
+        else:
+            req = json.loads(body)
+            seen.append(req)
+            out, code = {"reply": "grounded:" + req["message"], "session_id": "s",
+                         "history": []}, 200
+        data = json.dumps(out).encode()
+        writer.write(b"HTTP/1.1 %d OK\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: %d\r\nConnection: close\r\n\r\n" % (code, len(data)) + data)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}", seen
+
+
+async def test_chat_goes_to_the_card_grounded_brain_with_history(tmp_path):
+    server, url, seen = await _bridge()
+    sk, pub = keypair()
+    agent = A.Agent(A.Config(seckey=sk, state_dir=str(tmp_path), brain_url=url,
+                             card_id="dna_abc"))
+    user_sk, _ = keypair()
+    try:
+        await A.check_brain(agent.cfg)
+        for text in ("what are your hours?", "and on sunday?"):
+            reply = await agent.respond(agent.accept(A.build_reply_event("nip17", pub, text, user_sk)))
+        assert read_reply(reply, user_sk, pub).text == "grounded:and on sunday?"
+        assert seen[1]["history"] == [
+            {"role": "user", "content": "what are your hours?"},
+            {"role": "assistant", "content": "grounded:what are your hours?"}]
+    finally:
+        server.close()
+
+
+async def test_brain_for_another_business_is_refused(tmp_path):
+    server, url, _ = await _bridge(card_id="dna_other")
+    sk, _ = keypair()
+    try:
+        with pytest.raises(A.BrainMismatch):
+            await A.check_brain(A.Config(seckey=sk, state_dir=str(tmp_path),
+                                         brain_url=url, card_id="dna_abc"))
+    finally:
+        server.close()
+
+
+async def test_brain_failure_gives_safe_reply_and_is_not_remembered(tmp_path):
+    server, url, _ = await _bridge(fail=True)
+    sk, pub = keypair()
+    mem = FakeNipae()
+    agent = A.Agent(A.Config(seckey=sk, state_dir=str(tmp_path), brain_url=url),
+                    memory=A.ContactMemory("dna_abc", client=mem))
+    user_sk, _ = keypair()
+    try:
+        reply = await agent.respond(agent.accept(A.build_reply_event("nip44", pub, "hi", user_sk)))
+        assert read_reply(reply, user_sk, pub).text == A.UNAVAILABLE
+        assert mem.store == {}
+    finally:
+        server.close()
+
+
+async def test_history_survives_restart_and_stays_per_contact(tmp_path):
+    sk, pub = keypair()
+    mem = FakeNipae()
+    captured = []
+
+    async def llm(cfg, messages):
+        captured.append(messages)
+        return "ok"
+
+    def boot():
+        return A.Agent(A.Config(seckey=sk, state_dir=str(tmp_path)), llm=llm,
+                       memory=A.ContactMemory("dna_abc", client=mem))
+
+    alice, _ = keypair()
+    bob, _ = keypair()
+    await boot().respond(boot().accept(A.build_reply_event("nip44", pub, "I am Alice", alice)))
+    agent = boot()                                              # restart
+    await agent.respond(agent.accept(A.build_reply_event("nip44", pub, "who am I?", alice)))
+    await agent.respond(agent.accept(A.build_reply_event("nip44", pub, "who am I?", bob)))
+    assert [m["content"] for m in captured[1]] == ["I am Alice", "ok", "who am I?"]
+    assert [m["content"] for m in captured[2]] == ["who am I?"]     # Bob sees nothing of Alice
+    assert all(k.startswith("mem/helix/dna_abc/dm/") for k in mem.store)
+
+
+async def test_memory_is_off_by_default_and_outage_does_not_block(tmp_path):
+    sk, pub = keypair()
+    assert A.Agent(A.Config(seckey=sk, state_dir=str(tmp_path)), llm=echo_llm).memory is None
+
+    class Down:
+        def get(self, slug): raise OSError("relay down")
+        def set(self, slug, value): raise OSError("relay down")
+
+    agent = A.Agent(A.Config(seckey=sk, state_dir=str(tmp_path)), llm=echo_llm,
+                    memory=A.ContactMemory("dna_abc", client=Down()))
+    user_sk, _ = keypair()
+    reply = await agent.respond(agent.accept(A.build_reply_event("nip44", pub, "hi", user_sk)))
+    assert read_reply(reply, user_sk, pub).text == "echo:hi"
+
+
+def test_compiled_system_prompt_file_is_used(tmp_path):
+    f = tmp_path / "system-prompt.md"
+    f.write_text("You are the AI employee of Santino's Pizza.")
+    sk, _ = keypair()
+    assert "Santino" in A.system_prompt(A.Config(seckey=sk, system_prompt_file=str(f)))

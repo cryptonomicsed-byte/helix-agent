@@ -64,6 +64,13 @@ class Config:
     max_future: int = 300          # ... or timestamped further ahead than this
     max_in_flight: int = 32        # bounded work queue; excess is dropped, not queued
     rate_per_minute: int = 20      # per-sender
+    # One brain per business: when set, chat goes to the agent-voice HTTP
+    # bridge (the same card-grounded agent that answers calls) instead of a
+    # separate OmniRouter prompt.
+    brain_url: str = ""
+    card_id: str = ""              # expected card; the bridge must report the same one
+    system_prompt_file: str = ""   # OmniRouter mode: the compiler's system-prompt.md
+    memory: str = "off"            # "minipae": persist per-contact history (opt-in)
 
     @property
     def pubkey_hex(self) -> str:
@@ -81,7 +88,11 @@ class Config:
                           ("omnirouter_key_file", "HELIX_OMNIROUTER_KEY_FILE"),
                           ("model", "HELIX_MODEL"),
                           ("log_path", "HELIX_LOG_PATH"),
-                          ("state_dir", "HELIX_STATE_DIR")):
+                          ("state_dir", "HELIX_STATE_DIR"),
+                          ("brain_url", "HELIX_BRAIN_URL"),
+                          ("card_id", "HELIX_CARD_ID"),
+                          ("system_prompt_file", "HELIX_SYSTEM_PROMPT_FILE"),
+                          ("memory", "HELIX_MEMORY")):
             if env.get(var):
                 setattr(cfg, attr, env[var])
         return cfg
@@ -283,23 +294,99 @@ class SeenStore:
         return True
 
 
-# ── LLM call ─────────────────────────────────────────────────────────────────
+# ── Brain ────────────────────────────────────────────────────────────────────
+UNAVAILABLE = "I can't answer right now. Please try again shortly."
+
+
+class BrainMismatch(RuntimeError):
+    """The configured brain serves a different business card than expected."""
+
+
+def system_prompt(cfg: Config) -> str:
+    if cfg.system_prompt_file:
+        return Path(cfg.system_prompt_file).read_text()
+    return SYSTEM_PROMPT
+
+
+async def check_brain(cfg: Config) -> None:
+    """Fail at startup, not mid-conversation, if the brain is the wrong business."""
+    if not (cfg.brain_url and cfg.card_id):
+        return
+    import httpx
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{cfg.brain_url.rstrip('/')}/health")
+        resp.raise_for_status()
+        served = resp.json().get("card_id")
+    if served != cfg.card_id:
+        raise BrainMismatch(f"brain serves card {served!r}, expected {cfg.card_id!r}")
+
+
 async def call_llm(cfg: Config, messages: list[dict]) -> str:
+    """One reply for the conversation in `messages` (last entry is the user turn)."""
     import httpx
     try:
-        key = Path(cfg.omnirouter_key_file).read_text().strip()
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            if cfg.brain_url:
+                resp = await client.post(
+                    f"{cfg.brain_url.rstrip('/')}/chat",
+                    json={"message": messages[-1]["content"], "history": messages[:-1]})
+                resp.raise_for_status()
+                return resp.json()["reply"].strip()
+            key = Path(cfg.omnirouter_key_file).read_text().strip()
             resp = await client.post(
                 f"{cfg.omnirouter_base}/chat/completions",
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={"model": cfg.model, "max_tokens": 500,
-                      "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages},
+                      "messages": [{"role": "system", "content": system_prompt(cfg)}] + messages},
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception as exc:
-        log.error("LLM call failed: %s", type(exc).__name__)
-        return "I'm thinking... try again shortly."
+        log.error("brain call failed: %s", type(exc).__name__)
+        return UNAVAILABLE
+
+
+# ── Persistent per-contact memory (opt-in) ────────────────────────────────────
+class ContactMemory:
+    """Conversation history per contact, as encrypted minipae engrams.
+
+    Slug: mem/helix/<scope>/dm/<sender-pubkey>, where scope is the business
+    card id (or "personal"). It is its own namespace on purpose: agent-voice
+    loads everything under mem/card/<id>/ into call prompts, and one contact's
+    DMs must not surface in another caller's conversation.
+
+    Off unless HELIX_MEMORY=minipae: message history is not stored by default.
+    Best-effort throughout — a memory outage never blocks a reply.
+    """
+
+    def __init__(self, scope: str, client=None, max_turns: int = 20):
+        scope = "".join(c if c in "abcdefghijklmnopqrstuvwxyz0123456789_-" else "-"
+                        for c in (scope or "personal").lower())[:64]
+        self.prefix, self.max_turns, self._client = f"mem/helix/{scope}/dm/", max_turns, client
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = minipae.NipaeClient()      # needs NIPAE_NSEC + relays
+        return self._client
+
+    def load(self, sender: str) -> list[dict]:
+        try:
+            raw = self._get_client().get(self.prefix + sender)
+            turns = json.loads(raw) if raw else []
+            return [t for t in turns if isinstance(t, dict)
+                    and t.get("role") in ("user", "assistant")
+                    and isinstance(t.get("content"), str)][-self.max_turns:]
+        except Exception as e:
+            log.warning("memory read failed: %s", type(e).__name__)
+            return []
+
+    def save(self, sender: str, turns: list[dict]) -> bool:
+        try:
+            return bool(self._get_client().set(
+                self.prefix + sender, json.dumps(turns[-self.max_turns:], ensure_ascii=False)))
+        except Exception as e:
+            log.warning("memory write failed: %s", type(e).__name__)
+            return False
 
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
@@ -312,12 +399,15 @@ class Agent:
     cfg: Config
     llm: object = None                       # async (cfg, messages) -> str
     seen: SeenStore = None
+    memory: ContactMemory = None             # None = history lives in RAM only
     stats: dict = field(default_factory=lambda: defaultdict(int))
 
     def __post_init__(self):
         self.llm = self.llm or call_llm
         if self.seen is None:
             self.seen = SeenStore(Path(self.cfg.state_dir) / "seen-events")
+        if self.memory is None and self.cfg.memory == "minipae":
+            self.memory = ContactMemory(self.cfg.card_id)
         self.pub = self.cfg.pubkey_hex
         self.conversations = defaultdict(lambda: deque(maxlen=self.cfg.max_history))
         self._locks = defaultdict(asyncio.Lock)          # per-sender ordering
@@ -366,9 +456,17 @@ class Agent:
         """One chat turn for one sender; returns the signed reply event."""
         async with self._locks[msg.sender]:
             history = self.conversations[msg.sender]
+            loop = asyncio.get_running_loop()
+            if self.memory is not None and not history:      # first turn since start
+                history.extend(await loop.run_in_executor(None, self.memory.load, msg.sender))
             history.append({"role": "user", "content": msg.text})
             reply = await self.llm(self.cfg, list(history)[-self.cfg.context_turns:])
-            history.append({"role": "assistant", "content": reply})
+            if reply == UNAVAILABLE:
+                history.pop()                 # a failed turn is not conversation history
+            else:
+                history.append({"role": "assistant", "content": reply})
+                if self.memory is not None:
+                    await loop.run_in_executor(None, self.memory.save, msg.sender, list(history))
         return build_reply_event(msg.transport, msg.sender, reply, self.cfg.seckey)
 
     async def _work(self, ws, msg: Inbound):
@@ -455,6 +553,13 @@ class Agent:
 
     async def run_forever(self) -> int:
         import websockets
+        try:
+            await check_brain(self.cfg)
+        except BrainMismatch as exc:
+            log.critical("%s — stopping", exc)
+            return 3
+        except Exception as exc:              # brain down at boot: keep trying per message
+            log.warning("brain health check failed (%s); continuing", type(exc).__name__)
         backoff = 5
         while True:
             started = time.time()
