@@ -1,0 +1,5 @@
+websockets>=14.0
+httpx>=0.27
+pycryptodome>=3.20        # NIP-04 (kind 4 AES-CBC) decrypt + reply
+# Pinned to the same revision agent-voice uses; bump both together.
+minipae @ git+https://github.com/cryptonomicsed-byte/minipae.git@99eb98bf9fa4e679067f512d1e2595557cfc574a
